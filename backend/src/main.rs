@@ -5,19 +5,19 @@ mod wine_cask;
 
 use crate::multilogger::MultiLogger;
 use crate::steam_util::SteamUtil;
-use crate::wine_cask::app::{AppState, Request, RequestType, TaskType, UpdaterState, WineCask};
+use crate::wine_cask::app::{AppState, Command, MessageEnvelope, MessageType, UpdaterState, WineCask};
 use futures_channel::mpsc::{unbounded, UnboundedSender};
 use futures_util::{future, pin_mut, stream::TryStreamExt, StreamExt};
-use log::{error, info, Level};
+use log::{error, info, warn, Level};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::OpenOptions;
-use std::io::Error as IoError;
+use std::io::{Error as IoError, ErrorKind};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio_tungstenite::tungstenite::Message;
 
 type Tx = UnboundedSender<Message>;
@@ -27,34 +27,36 @@ type ArcWineCask = Arc<WineCask>;
 
 #[tokio::main]
 async fn main() -> Result<(), IoError> {
-    configure_logger().unwrap();
+    configure_logger()?;
 
     let addr = get_server_address();
 
     let state = PeerMap::new(Mutex::new(HashMap::new()));
+    let queue_notify = Arc::new(Notify::new());
 
-    let steam_util = SteamUtil::new(get_steam_directory());
-
+    let steam_util = SteamUtil::new(get_steam_directory()?);
     let app_state = AsyncAppState::new(Mutex::new(AppState {
-        available_flavors: Vec::new(),
-        installed_compatibility_tools: Vec::new(),
-        in_progress: None,
-        task_queue: VecDeque::new(),
+        catalog_flavors: Vec::new(),
+        installed_tools: Vec::new(),
+        virtual_tools: Vec::new(),
+        current_operation: None,
+        queued_operations: Vec::new(),
         updater_state: UpdaterState::Idle,
         updater_last_check: None,
-        available_compat_tools: None,
-        flavors: Vec::new(),
+        steam_visible_tools: Vec::new(),
+        operation_queue: VecDeque::new(),
     }));
 
     let wine_cask = WineCask {
         steam_util,
-        app_state: app_state.clone(),
+        app_state,
+        queue_notify: queue_notify.clone(),
+        virtual_tool_manifest_path: get_virtual_tool_manifest_path(),
     };
 
     initialize_app_state(&wine_cask).await;
 
     let wine_cask_arc = ArcWineCask::new(wine_cask);
-
     tokio::spawn(wine_cask::process_queue(
         wine_cask_arc.clone(),
         state.clone(),
@@ -67,8 +69,13 @@ async fn main() -> Result<(), IoError> {
 }
 
 async fn start_server(addr: String, wine_cask: Arc<WineCask>, state: PeerMap) {
-    let try_socket = TcpListener::bind(&addr).await;
-    let listener = try_socket.expect("Failed to bind");
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            error!("Failed to bind websocket server to {}: {}", addr, err);
+            return;
+        }
+    };
     info!("Listening on: {}", addr);
 
     while let Ok((stream, addr)) = listener.accept().await {
@@ -89,9 +96,13 @@ async fn handle_connection(
 ) {
     info!("Incoming TCP connection from: {}", addr);
 
-    let ws_stream = tokio_tungstenite::accept_async(raw_stream)
-        .await
-        .expect("Error during the websocket handshake occurred");
+    let ws_stream = match tokio_tungstenite::accept_async(raw_stream).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            error!("WebSocket handshake failed for {}: {}", addr, err);
+            return;
+        }
+    };
     info!("WebSocket connection established: {}", addr);
 
     let (tx, rx) = unbounded();
@@ -104,16 +115,13 @@ async fn handle_connection(
         let peer_map_clone = Arc::clone(&peer_map);
         async move {
             if msg.is_text() {
-                info!(
-                    "Received a message from {}: {}",
-                    addr,
-                    msg.to_text().unwrap()
-                );
-
-                if let Ok(msg) = &msg.to_text() {
-                    if !msg.is_empty() {
-                        handle_request(&wine_cask_clone, msg, &peer_map_clone).await;
+                match msg.to_text() {
+                    Ok(text) if !text.is_empty() => {
+                        info!("Received a message from {}", addr);
+                        handle_request(&wine_cask_clone, text, &peer_map_clone).await;
                     }
+                    Ok(_) => warn!("Received empty websocket message from {}", addr),
+                    Err(err) => warn!("Received invalid text frame from {}: {}", addr, err),
                 }
             } else {
                 info!("Unhandled message from {}: {:?}", addr, msg);
@@ -133,22 +141,12 @@ async fn handle_connection(
 }
 
 fn configure_logger() -> Result<(), IoError> {
-    // Check for DECKY_PLUGIN_LOG environment variable
     let log_path = match env::var("DECKY_PLUGIN_LOG") {
         Ok(path) => path,
-        Err(_) => {
-            // If DECKY_PLUGIN_LOG is not found, check for DECKY_PLUGIN_LOG_DIR
-            match env::var("DECKY_PLUGIN_LOG_DIR") {
-                Ok(log_dir) => {
-                    // Create the log directory if it doesn't exist
-                    format!("{}/wine-cask.log", log_dir)
-                }
-                Err(_) => {
-                    // If neither variable is set, use the /tmp directory
-                    "/tmp/decky-wine-cellar.log".to_string()
-                }
-            }
-        }
+        Err(_) => match env::var("DECKY_PLUGIN_LOG_DIR") {
+            Ok(log_dir) => format!("{}/wine-cask.log", log_dir),
+            Err(_) => "/tmp/decky-wine-cellar.log".to_string(),
+        },
     };
 
     let target = OpenOptions::new()
@@ -156,7 +154,8 @@ fn configure_logger() -> Result<(), IoError> {
         .append(true)
         .open(&log_path)?;
 
-    MultiLogger::init(target, Level::Info).expect("Could not configure logger");
+    MultiLogger::init(target, Level::Info)
+        .map_err(|err| IoError::other(format!("Could not configure logger: {err}")))?;
 
     info!("Logging to: {}", log_path);
 
@@ -169,70 +168,99 @@ fn get_server_address() -> String {
         .unwrap_or_else(|| "127.0.0.1:8887".to_string())
 }
 
-fn get_steam_directory() -> PathBuf {
-    match env::var("DECKY_USER_HOME") {
+fn get_steam_directory() -> Result<PathBuf, IoError> {
+    let result = match env::var("DECKY_USER_HOME") {
         Ok(value) => {
             info!("Using DECKY_USER_HOME: {}", value);
-            SteamUtil::find_steam_directory(Some(value)).unwrap() // Todo: Handle if no steam folder is found, although this should never happen
+            SteamUtil::find_steam_directory(Some(value))
         }
         Err(_) => {
-            error!(
-                "Couldn't find environment variable DECKY_USER_HOME, using default steam directory"
-            );
-            SteamUtil::find_steam_directory(None).unwrap()
+            warn!("Couldn't find DECKY_USER_HOME, trying HOME/USERPROFILE defaults");
+            SteamUtil::find_steam_directory(None)
         }
-    }
+    };
+
+    result.map_err(|err| IoError::new(ErrorKind::NotFound, err.to_string()))
+}
+
+fn get_virtual_tool_manifest_path() -> PathBuf {
+    let base_dir = env::var("DECKY_PLUGIN_SETTINGS_DIR")
+        .or_else(|_| env::var("DECKY_PLUGIN_RUNTIME_DIR"))
+        .unwrap_or_else(|_| "/tmp/decky-wine-cellar".to_string());
+    PathBuf::from(base_dir).join("virtual_tools.json")
 }
 
 async fn initialize_app_state(wine_cask: &WineCask) {
-    wine_cask
-        .app_state
-        .lock()
-        .await
-        .installed_compatibility_tools = wine_cask.list_compatibility_tools().unwrap();
+    wine_cask.sync_backend_state().await;
 }
 
 async fn handle_request(wine_cask: &Arc<WineCask>, msg: &str, peer_map: &PeerMap) {
-    if let Ok(request) = serde_json::from_str::<Request>(msg) {
-        match request.r#type {
-            RequestType::RequestState => {
-                // Assumes available_compat_tools is Some
+    let request = match serde_json::from_str::<MessageEnvelope>(msg) {
+        Ok(request) => request,
+        Err(err) => {
+            warn!("Failed to parse websocket request: {}", err);
+            wine_cask
+                .broadcast_notification(peer_map, "Error: Invalid request payload")
+                .await;
+            return;
+        }
+    };
+
+    match request.r#type {
+        MessageType::GetState => {
+            wine_cask.broadcast_app_state(peer_map).await;
+        }
+        MessageType::ReportSteamVisibleTools => {
+            if let Some(steam_visible_tools) = request.steam_visible_tools {
                 wine_cask
-                    .process_frontend_compat_tools_update(
+                    .process_frontend_compat_tools_update(peer_map, steam_visible_tools)
+                    .await;
+            } else {
+                wine_cask
+                    .broadcast_notification(
                         peer_map,
-                        request.available_compat_tools.unwrap(),
+                        "Error: Steam tool observation payload missing",
                     )
                     .await;
-                wine_cask.update_used_by_games(peer_map).await;
             }
-            RequestType::Task => {
-                if let Some(task) = request.task {
-                    if task.r#type == TaskType::InstallCompatibilityTool {
-                        wine_cask.add_to_task_queue(task, peer_map).await;
-                    } else if task.r#type == TaskType::CancelCompatibilityToolInstall {
-                        wine_cask
-                            .remove_or_cancel_from_task_queue(task, peer_map)
-                            .await;
-                    } else if task.r#type == TaskType::UninstallCompatibilityTool {
-                        wine_cask
-                            .uninstall_compatibility_tool(
-                                task.uninstall.unwrap().steam_compatibility_tool,
-                                peer_map,
-                            )
-                            .await;
-                    } else if task.r#type == TaskType::CheckForFlavorUpdates {
+        }
+        MessageType::Command => {
+            if let Some(command) = request.command {
+                match command {
+                    Command::RefreshCatalog => {
                         wine_cask.check_for_flavor_updates(peer_map, true).await;
                     }
-                } else {
-                    wine_cask
-                        .broadcast_notification(
-                            peer_map,
-                            "Error: Something went wrong with the task request",
-                        )
-                        .await;
+                    Command::InstallCatalogRelease { release_id, target } => {
+                        wine_cask
+                            .queue_install_catalog_release(release_id, target, peer_map)
+                            .await;
+                    }
+                    Command::UninstallInstalledTool { installed_tool_id } => {
+                        wine_cask
+                            .queue_uninstall_installed_tool(installed_tool_id, peer_map)
+                            .await;
+                    }
+                    Command::CancelOperation { operation_id } => {
+                        wine_cask.cancel_operation(operation_id, peer_map).await;
+                    }
+                    Command::CreateVirtualTool { user_label } => {
+                        wine_cask.queue_create_virtual_tool(user_label, peer_map).await;
+                    }
+                    Command::RenameVirtualTool {
+                        virtual_tool_id,
+                        user_label,
+                    } => {
+                        wine_cask
+                            .queue_rename_virtual_tool(virtual_tool_id, user_label, peer_map)
+                            .await;
+                    }
                 }
+            } else {
+                wine_cask
+                    .broadcast_notification(peer_map, "Error: Command request missing command payload")
+                    .await;
             }
-            _ => {}
         }
+        MessageType::UpdateState | MessageType::UpdateOperations | MessageType::Notification => {}
     }
 }

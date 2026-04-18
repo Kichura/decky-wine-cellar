@@ -1,94 +1,102 @@
 import { CompatToolInfo } from "./utils/steamUtils";
 
 export type GitHubRelease = {
-  url: String;
+  url: string;
   id: number;
   draft: boolean;
   prerelease: boolean;
-  name: String;
-  tag_name: String;
+  name: string;
+  tag_name: string;
   assets: Asset[];
-  created_at: String;
-  published_at: String;
-  tarball_url: String;
-  body: String;
+  created_at: string;
+  published_at: string;
+  tarball_url: string;
+  body: string;
 };
 
 export type Asset = {
-  url: String;
+  url: string;
   id: number;
-  name: String;
-  content_type: String;
-  state: String;
+  name: string;
+  content_type: string;
+  state: string;
   size: number;
   download_count: number;
-  created_at: String;
-  updated_at: String;
+  created_at: string;
+  updated_at: string;
+  browser_download_url: string;
 };
 
-export type AppState = {
-  available_flavors: Flavor[];
-  installed_compatibility_tools: SteamCompatibilityTool[];
-  in_progress?: QueueCompatibilityTool;
-  task_queue: Task[];
-  updater_state: UpdaterState;
-  updater_last_check?: number;
-};
-
-export type Task = {
-  type: TaskType;
-  install?: Install;
-  uninstall?: Uninstall;
-};
-
-export enum TaskType {
-  CheckForFlavorUpdates = "CheckForFlavorUpdates",
-  InstallCompatibilityTool = "InstallCompatibilityTool",
-  CancelCompatibilityToolInstall = "CancelCompatibilityToolInstall",
-  UninstallCompatibilityTool = "UninstallCompatibilityTool",
-}
-
-export type Flavor = {
-  flavor: CompatibilityToolFlavor;
-  releases: GitHubRelease[];
-};
-
-export type Request = {
-  type: RequestType;
-  task?: Task;
-  available_compat_tools?: CompatToolInfo[];
-  notification?: string;
-  app_state?: AppState;
-};
-
-export type Install = {
+export type CatalogRelease = {
+  id: string;
   flavor: CompatibilityToolFlavor;
   release: GitHubRelease;
 };
 
-export type Uninstall = {
+export type Flavor = {
   flavor: CompatibilityToolFlavor;
-  steam_compatibility_tool: SteamCompatibilityTool;
+  releases: CatalogRelease[];
 };
 
-export type SteamCompatibilityTool = {
+export enum InstalledToolSource {
+  Direct = "Direct",
+  Virtual = "Virtual",
+}
+
+export type InstalledCompatibilityTool = {
+  id: string;
   path: string;
-  //name: string;
   directory_name: string;
-  internal_name: string;
   display_name: string;
+  internal_name: string;
   used_by_games: string[];
   requires_restart: boolean;
   flavor: CompatibilityToolFlavor;
+  catalog_release_id?: string;
   github_release?: GitHubRelease;
+  source: InstalledToolSource;
+  virtual_tool_id?: string;
+  user_label?: string;
 };
 
-export type QueueCompatibilityTool = {
-  flavor: CompatibilityToolFlavor;
-  name: string;
-  url: string;
-  state: QueueCompatibilityToolState;
+export type VirtualCompatibilityTool = {
+  id: string;
+  user_label: string;
+  steam_internal_name: string;
+  directory_name: string;
+  installed_tool_id?: string;
+  current_payload_release_id?: string;
+  current_payload_name?: string;
+  current_payload_flavor: CompatibilityToolFlavor;
+  github_release?: GitHubRelease;
+  requires_restart: boolean;
+  used_by_games: string[];
+};
+
+export enum OperationKind {
+  Install = "Install",
+  Uninstall = "Uninstall",
+  CreateVirtualTool = "CreateVirtualTool",
+  RenameVirtualTool = "RenameVirtualTool",
+}
+
+export enum OperationState {
+  Pending = "Pending",
+  Running = "Running",
+  Downloading = "Downloading",
+  Extracting = "Extracting",
+  Cancelling = "Cancelling",
+}
+
+export type OperationInfo = {
+  id: string;
+  label: string;
+  kind: OperationKind;
+  state: OperationState;
   progress: number;
+  release_id?: string;
+  installed_tool_id?: string;
+  virtual_tool_id?: string;
 };
 
 export enum UpdaterState {
@@ -96,23 +104,93 @@ export enum UpdaterState {
   Checking = "Checking",
 }
 
+export type AppState = {
+  catalog_flavors: Flavor[];
+  installed_tools: InstalledCompatibilityTool[];
+  virtual_tools: VirtualCompatibilityTool[];
+  current_operation?: OperationInfo;
+  queued_operations: OperationInfo[];
+  updater_state: UpdaterState;
+  updater_last_check?: number;
+};
+
+export enum InstallTargetType {
+  Direct = "Direct",
+  VirtualTool = "VirtualTool",
+}
+
+export type InstallTarget =
+  | {
+      type: InstallTargetType.Direct;
+    }
+  | {
+      type: InstallTargetType.VirtualTool;
+      virtual_tool_id: string;
+    };
+
+export enum CommandType {
+  RefreshCatalog = "RefreshCatalog",
+  InstallCatalogRelease = "InstallCatalogRelease",
+  UninstallInstalledTool = "UninstallInstalledTool",
+  CancelOperation = "CancelOperation",
+  CreateVirtualTool = "CreateVirtualTool",
+  RenameVirtualTool = "RenameVirtualTool",
+}
+
+export type Command =
+  | {
+      type: CommandType.RefreshCatalog;
+    }
+  | {
+      type: CommandType.InstallCatalogRelease;
+      release_id: string;
+      target: InstallTarget;
+    }
+  | {
+      type: CommandType.UninstallInstalledTool;
+      installed_tool_id: string;
+    }
+  | {
+      type: CommandType.CancelOperation;
+      operation_id: string;
+    }
+  | {
+      type: CommandType.CreateVirtualTool;
+      user_label: string;
+    }
+  | {
+      type: CommandType.RenameVirtualTool;
+      virtual_tool_id: string;
+      user_label: string;
+    };
+
+export enum MessageType {
+  GetState = "GetState",
+  ReportSteamVisibleTools = "ReportSteamVisibleTools",
+  Command = "Command",
+  UpdateState = "UpdateState",
+  UpdateOperations = "UpdateOperations",
+  Notification = "Notification",
+}
+
+export type OperationStateSnapshot = {
+  current_operation?: OperationInfo;
+  queued_operations: OperationInfo[];
+};
+
+export type MessageEnvelope = {
+  type: MessageType;
+  command?: Command;
+  steam_visible_tools?: CompatToolInfo[];
+  notification?: string;
+  app_state?: AppState;
+  operation_state?: OperationStateSnapshot;
+};
+
 export enum CompatibilityToolFlavor {
   Unknown = "Unknown",
   ProtonGE = "ProtonGE",
-  //SteamTinkerLaunch = "SteamTinkerLaunch",
+  SteamTinkerLaunch = "SteamTinkerLaunch",
   Luxtorpeda = "Luxtorpeda",
   Boxtron = "Boxtron",
-}
-
-export enum QueueCompatibilityToolState {
-  Extracting = "Extracting",
-  Downloading = "Downloading",
-  Waiting = "Waiting",
-}
-
-export enum RequestType {
-  Task = "Task",
-  RequestState = "RequestState",
-  UpdateState = "UpdateState",
-  Notification = "Notification",
 }

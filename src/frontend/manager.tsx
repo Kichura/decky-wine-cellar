@@ -11,18 +11,21 @@ import {
   showModal,
 } from "@decky/ui";
 import { FaEllipsisH } from "react-icons/fa";
+import ChangeLogModal from "../components/changeLogModal";
+import { showTextPromptModal } from "../components/textPromptModal";
 import {
   AppState,
-  CompatibilityToolFlavor,
   GitHubRelease,
-  Request,
-  RequestType,
-  SteamCompatibilityTool,
-  TaskType,
+  InstalledCompatibilityTool,
+  InstalledToolSource,
+  VirtualCompatibilityTool,
 } from "../types";
-import { error } from "../utils/logger";
+import {
+  createVirtualTool,
+  renameVirtualTool,
+  uninstallInstalledTool,
+} from "../utils/backendApi";
 import { RestartSteamClient } from "../utils/steamUtils";
-import ChangeLogModal from "../components/changeLogModal";
 
 export default function ManagerTab({
   appState,
@@ -31,152 +34,287 @@ export default function ManagerTab({
   appState: AppState;
   socket: WebSocket;
 }) {
-  const handleUninstall = (release: SteamCompatibilityTool) => {
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      const response: Request = {
-        type: RequestType.Task,
-        task: {
-          type: TaskType.UninstallCompatibilityTool,
-          uninstall: {
-            flavor: CompatibilityToolFlavor.Unknown,
-            steam_compatibility_tool: release,
-          },
-        },
-      };
-      socket.send(JSON.stringify(response));
-    } else {
-      error("WebSocket not alive...");
-    }
-  };
+  const directInstalledTools = appState.installed_tools.filter(
+    (tool) => tool.source !== InstalledToolSource.Virtual,
+  );
 
-  const handleViewUsedByGames = (release: SteamCompatibilityTool) => {
+  const showCreateVirtualToolModal = () =>
+    showTextPromptModal({
+      title: "Create Virtual Tool",
+      description:
+        "Create a stable compatibility slot. The first time Steam sees it, a restart will still be required.",
+      confirmLabel: "Create",
+      onSubmit: (value) => {
+        createVirtualTool(socket, value);
+      },
+    });
+
+  const handleViewUsedByGames = (title: string, usedByGames: string[]) => {
     showModal(
       <ConfirmModal
-        strTitle={"Steam Applications using " + release.display_name}
-        strDescription={release.used_by_games.join(", ")}
+        strTitle={"Steam applications using " + title}
+        strDescription={usedByGames.join(", ")}
         strOKButtonText={"OK"}
       />,
     );
   };
 
-  const handleViewChangeLog = (release: GitHubRelease) =>
+  const handleViewChangeLog = (release: GitHubRelease) => {
     showModal(<ChangeLogModal release={release} />);
+  };
 
-  const handleUninstallModal = (release: SteamCompatibilityTool) =>
+  const handleRemoveInstalledTool = (tool: InstalledCompatibilityTool) => {
+    uninstallInstalledTool(socket, tool.id);
+  };
+
+  const handleRemoveInstalledToolModal = (tool: InstalledCompatibilityTool) =>
     showModal(
       <ConfirmModal
-        strTitle={"Uninstallation of " + release.display_name}
-        strDescription={"Are you sure want to remove this compatibility tool?"}
-        strOKButtonText={"Uninstall"}
+        strTitle={"Remove " + getInstalledToolLabel(tool)}
+        strDescription={"Are you sure you want to remove this compatibility tool?"}
+        strOKButtonText={"Remove"}
         strCancelButtonText={"Cancel"}
         onOK={() => {
-          handleUninstall(release);
+          handleRemoveInstalledTool(tool);
         }}
       />,
     );
 
+  const handleRemoveVirtualTool = (virtualTool: VirtualCompatibilityTool) => {
+    if (virtualTool.installed_tool_id == null) {
+      return;
+    }
+
+    uninstallInstalledTool(socket, virtualTool.installed_tool_id);
+  };
+
+  const handleRemoveVirtualToolModal = (virtualTool: VirtualCompatibilityTool) =>
+    showModal(
+      <ConfirmModal
+        strTitle={"Remove " + virtualTool.user_label}
+        strDescription={
+          "Removing a virtual compatibility tool deletes the slot and any mounted payload."
+        }
+        strOKButtonText={"Remove"}
+        strCancelButtonText={"Cancel"}
+        onOK={() => {
+          handleRemoveVirtualTool(virtualTool);
+        }}
+      />,
+    );
+
+  const showRenameVirtualToolModal = (virtualTool: VirtualCompatibilityTool) =>
+    showTextPromptModal({
+      title: "Rename Virtual Tool",
+      initialValue: virtualTool.user_label,
+      confirmLabel: "Rename",
+      onSubmit: (value) => {
+        renameVirtualTool(socket, virtualTool.id, value);
+      },
+    });
+
   return (
     <DialogBody>
       <DialogControlsSection>
-        <DialogControlsSectionHeader>Installed</DialogControlsSectionHeader>
-        <ul>
-          {appState.installed_compatibility_tools.map(
-            (steamCompatibilityTool: SteamCompatibilityTool) => {
-              return (
-                <li
+        <DialogControlsSectionHeader>Virtual Tools</DialogControlsSectionHeader>
+        <DialogButton onClick={showCreateVirtualToolModal}>
+          Create Virtual Tool
+        </DialogButton>
+        {appState.virtual_tools.length === 0 ? (
+          <div style={{ paddingTop: "10px" }}>
+            No virtual tools yet. Create one to reuse a stable Steam-visible slot
+            without restarting for every payload change.
+          </div>
+        ) : (
+          <ul style={{ listStyleType: "none" }}>
+            {appState.virtual_tools.map((virtualTool) => (
+              <li
+                key={virtualTool.id}
+                style={{
+                  display: "flex",
+                  flexDirection: "row",
+                  alignItems: "center",
+                  paddingBottom: "10px",
+                }}
+              >
+                <span>
+                  {virtualTool.user_label}
+                  {virtualTool.current_payload_name != null &&
+                    " (" + virtualTool.current_payload_name + ")"}
+                  {virtualTool.current_payload_name == null && " (Empty)"}
+                  {virtualTool.requires_restart && " (Requires Restart)"}
+                  {virtualTool.used_by_games.length !== 0 && " (Used By Games)"}
+                </span>
+                <Focusable
                   style={{
+                    marginLeft: "auto",
+                    boxShadow: "none",
                     display: "flex",
-                    flexDirection: "row",
-                    alignItems: "center",
-                    paddingBottom: "10px",
+                    justifyContent: "right",
                   }}
                 >
-                  <span>
-                    {steamCompatibilityTool.display_name}
-                    {steamCompatibilityTool.requires_restart &&
-                      " (Requires Restart)"}
-                    {steamCompatibilityTool.used_by_games.length != 0 &&
-                      " (Used By Games)"}
-                  </span>
-                  <Focusable
+                  <DialogButton
                     style={{
-                      marginLeft: "auto",
-                      boxShadow: "none",
-                      display: "flex",
-                      justifyContent: "right",
+                      height: "40px",
+                      width: "40px",
+                      padding: "10px 12px",
+                      minWidth: "40px",
                     }}
-                  >
-                    <DialogButton
-                      style={{
-                        height: "40px",
-                        width: "40px",
-                        padding: "10px 12px",
-                        minWidth: "40px",
-                      }}
-                      onClick={(e: MouseEvent) =>
-                        showContextMenu(
-                          <Menu label="Runner Actions">
+                    onClick={(event: MouseEvent) =>
+                      showContextMenu(
+                        <Menu label="Virtual Tool Actions">
+                          <MenuItem
+                            onClick={() => {
+                              showRenameVirtualToolModal(virtualTool);
+                            }}
+                          >
+                            Rename
+                          </MenuItem>
+                          <MenuItem
+                            disabled={virtualTool.installed_tool_id == null}
+                            onClick={() => {
+                              handleRemoveVirtualToolModal(virtualTool);
+                            }}
+                          >
+                            Remove
+                          </MenuItem>
+                          {virtualTool.used_by_games.length !== 0 && (
                             <MenuItem
-                              onSelected={() => {}}
                               onClick={() => {
-                                handleUninstallModal(steamCompatibilityTool);
+                                handleViewUsedByGames(
+                                  virtualTool.user_label,
+                                  virtualTool.used_by_games,
+                                );
                               }}
                             >
-                              Uninstall
+                              View Used By Games
                             </MenuItem>
-                            {steamCompatibilityTool.used_by_games.length !=
-                              0 && (
-                              <MenuItem
-                                onSelected={() => {}}
-                                onClick={() => {
-                                  handleViewUsedByGames(steamCompatibilityTool);
-                                }}
-                              >
-                                View Used By Games
-                              </MenuItem>
-                            )}
-                            {steamCompatibilityTool.github_release != null && (
-                              <MenuItem
-                                onClick={() => {
-                                  if (
-                                    steamCompatibilityTool.github_release !=
-                                    null
-                                  ) {
-                                    handleViewChangeLog(
-                                      steamCompatibilityTool.github_release,
-                                    );
-                                  }
-                                }}
-                              >
-                                View Change Log
-                              </MenuItem>
-                            )}
-                            {steamCompatibilityTool.requires_restart && (
-                              <MenuItem
-                                disabled={
-                                  !steamCompatibilityTool.requires_restart
+                          )}
+                          {virtualTool.github_release != null && (
+                            <MenuItem
+                              onClick={() => {
+                                if (virtualTool.github_release != null) {
+                                  handleViewChangeLog(virtualTool.github_release);
                                 }
-                                onClick={() => {
-                                  RestartSteamClient();
-                                }}
-                              >
-                                Restart Steam
-                              </MenuItem>
-                            )}
-                          </Menu>,
-                          e.currentTarget ?? window,
-                        )
-                      }
-                    >
-                      <FaEllipsisH />
-                    </DialogButton>
-                  </Focusable>
-                </li>
-              );
-            },
-          )}
+                              }}
+                            >
+                              View Current Payload Change Log
+                            </MenuItem>
+                          )}
+                          {virtualTool.requires_restart && (
+                            <MenuItem
+                              onClick={() => {
+                                RestartSteamClient();
+                              }}
+                            >
+                              Restart Steam
+                            </MenuItem>
+                          )}
+                        </Menu>,
+                        event.currentTarget ?? window,
+                      )
+                    }
+                  >
+                    <FaEllipsisH />
+                  </DialogButton>
+                </Focusable>
+              </li>
+            ))}
+          </ul>
+        )}
+      </DialogControlsSection>
+
+      <DialogControlsSection>
+        <DialogControlsSectionHeader>Installed</DialogControlsSectionHeader>
+        <ul style={{ listStyleType: "none" }}>
+          {directInstalledTools.map((installedTool) => (
+            <li
+              key={installedTool.id}
+              style={{
+                display: "flex",
+                flexDirection: "row",
+                alignItems: "center",
+                paddingBottom: "10px",
+              }}
+            >
+              <span>
+                {getInstalledToolLabel(installedTool)}
+                {installedTool.requires_restart && " (Requires Restart)"}
+                {installedTool.used_by_games.length !== 0 && " (Used By Games)"}
+              </span>
+              <Focusable
+                style={{
+                  marginLeft: "auto",
+                  boxShadow: "none",
+                  display: "flex",
+                  justifyContent: "right",
+                }}
+              >
+                <DialogButton
+                  style={{
+                    height: "40px",
+                    width: "40px",
+                    padding: "10px 12px",
+                    minWidth: "40px",
+                  }}
+                  onClick={(event: MouseEvent) =>
+                    showContextMenu(
+                      <Menu label="Installed Tool Actions">
+                        <MenuItem
+                          onClick={() => {
+                            handleRemoveInstalledToolModal(installedTool);
+                          }}
+                        >
+                          Remove
+                        </MenuItem>
+                        {installedTool.used_by_games.length !== 0 && (
+                          <MenuItem
+                            onClick={() => {
+                              handleViewUsedByGames(
+                                getInstalledToolLabel(installedTool),
+                                installedTool.used_by_games,
+                              );
+                            }}
+                          >
+                            View Used By Games
+                          </MenuItem>
+                        )}
+                        {installedTool.github_release != null && (
+                          <MenuItem
+                            onClick={() => {
+                              if (installedTool.github_release != null) {
+                                handleViewChangeLog(installedTool.github_release);
+                              }
+                            }}
+                          >
+                            View Change Log
+                          </MenuItem>
+                        )}
+                        {installedTool.requires_restart && (
+                          <MenuItem
+                            onClick={() => {
+                              RestartSteamClient();
+                            }}
+                          >
+                            Restart Steam
+                          </MenuItem>
+                        )}
+                      </Menu>,
+                      event.currentTarget ?? window,
+                    )
+                  }
+                >
+                  <FaEllipsisH />
+                </DialogButton>
+              </Focusable>
+            </li>
+          ))}
         </ul>
       </DialogControlsSection>
     </DialogBody>
   );
+}
+
+function getInstalledToolLabel(tool: InstalledCompatibilityTool): string {
+  return tool.user_label ?? tool.display_name;
 }

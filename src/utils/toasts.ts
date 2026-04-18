@@ -1,47 +1,49 @@
 import { toaster, ToastData } from "@decky/api";
-import { log, error } from "./logger";
-import { Request, RequestType } from "../types";
-import { v4 as uuidv4 } from "uuid"; // Import UUID v4
+import { v4 as uuidv4 } from "uuid";
+import { MessageEnvelope, MessageType } from "../types";
+import { error, log } from "./logger";
 
-let shouldReconnect = true; // Global flag to control reconnection
-let socket: WebSocket | null = null; // Global WebSocket reference
+let shouldReconnect = true;
+let socket: WebSocket | null = null;
 
 export const setupToasts = (): void => {
   const setupWebsocket = (): void => {
     if (!shouldReconnect) {
-      return; // If reconnection is disabled, don't proceed
+      return;
     }
 
     socket = new WebSocket("ws://localhost:8887");
-    const uniqueId = uuidv4(); // Generate a unique identifier using UUID
+    const uniqueId = uuidv4();
 
     socket.onopen = (): void => {
-      log("WebSocket connection established. Unique Identifier: ", uniqueId);
+      log("WebSocket connection established. Unique Identifier:", uniqueId);
     };
 
-    socket.onmessage = (e: MessageEvent): void => {
-      const response: Request = JSON.parse(e.data);
-      if (response.type == RequestType.Notification) {
-        if (response.notification != null && response.notification != "") {
-          let toastData: ToastData = {
-            title: "Wine Cellar",
-            body: response.notification,
-            showToast: true,
-          };
+    socket.onmessage = (event: MessageEvent): void => {
+      const response: MessageEnvelope = JSON.parse(event.data);
+      if (
+        response.type === MessageType.Notification &&
+        response.notification != null &&
+        response.notification !== ""
+      ) {
+        const toastData: ToastData = {
+          title: "Wine Cellar",
+          body: response.notification,
+          showToast: true,
+        };
 
-          toaster.toast(toastData);
-          log("Received backend notification: " + response.notification);
-        }
+        toaster.toast(toastData);
+        log("Received backend notification: " + response.notification);
       }
     };
 
-    socket.onclose = (e: CloseEvent): void => {
+    socket.onclose = (event: CloseEvent): void => {
       if (shouldReconnect) {
         log(
           "Socket is closed. Unique Identifier:",
           uniqueId,
           "Reconnect will be attempted in 5 seconds.",
-          e.reason,
+          event.reason,
         );
         setTimeout(() => {
           setupWebsocket();
@@ -54,10 +56,10 @@ export const setupToasts = (): void => {
       }
     };
 
-    socket.onerror = (err: Event): void => {
+    socket.onerror = (event: Event): void => {
       error(
-        "Socket encountered error: ",
-        (err as ErrorEvent).message,
+        "Socket encountered error:",
+        (event as ErrorEvent).message,
         "Unique Identifier:",
         uniqueId,
       );
@@ -70,7 +72,6 @@ export const setupToasts = (): void => {
   setupWebsocket();
 };
 
-// Function to forcibly close the WebSocket and prevent reconnection
 export const forceCloseToastsWebSocket = (): void => {
   shouldReconnect = false;
   if (socket) {

@@ -1,9 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use std::fmt;
-use std::fmt::{Display, Formatter};
+use std::fmt::{self, Display, Formatter};
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct Release {
     pub url: String,
     pub id: u64,
@@ -18,7 +17,7 @@ pub struct Release {
     pub body: String,
 }
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct Asset {
     pub url: String,
     pub id: u64,
@@ -32,7 +31,7 @@ pub struct Asset {
     pub browser_download_url: String,
 }
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct Response {
     pub message: String,
 }
@@ -43,6 +42,7 @@ pub async fn list_all_releases(
 ) -> Result<Vec<Release>, GitHubUtilError> {
     let client = reqwest::Client::builder()
         .user_agent("FlashyReese/decky-wine-cellar")
+        .no_proxy()
         .build()
         .expect("Failed to create HTTP client");
 
@@ -55,29 +55,49 @@ pub async fn list_all_releases(
             owner, repository, page
         );
 
-        let response = client.get(&url).send().await?;
+        let response = match client.get(&url).send().await {
+            Ok(response) => response,
+            Err(err) => {
+                eprintln!("reqwest display: {}", err);
+                eprintln!("reqwest debug: {:#?}", err);
+                eprintln!("is_connect: {}", err.is_connect());
+                eprintln!("is_timeout: {}", err.is_timeout());
+                eprintln!("is_request: {}", err.is_request());
+                eprintln!("url: {:?}", err.url());
 
-        if response.status().is_success() {
-            let response_text = response.text().await?;
-            if let Ok(page_releases) = serde_json::from_str::<Vec<Release>>(&response_text) {
+                let mut source = err.source();
+                while let Some(src) = source {
+                    eprintln!("caused by: {}", src);
+                    source = src.source();
+                }
+
+                return Err(err.into());
+            }
+        };
+
+        let response = response.error_for_status()?;
+
+        let response_text = response.text().await?;
+
+        match serde_json::from_str::<Vec<Release>>(&response_text) {
+            Ok(page_releases) => {
                 if page_releases.is_empty() {
-                    break; // No more releases, exit the loop
+                    break;
                 }
 
                 releases.extend(page_releases);
-            } else {
-                return if let Ok(response) = serde_json::from_str::<Response>(&response_text) {
-                    Err(GitHubUtilError::ResponseError(response.message))
-                } else {
-                    Err(GitHubUtilError::JsonParsingError(response_text))
-                };
+                page += 1;
             }
-            page += 1;
-        } else {
-            return Err(GitHubUtilError::RequestError(format!(
-                "Failed to fetch releases: {}",
-                response.status()
-            )));
+            Err(json_err) => {
+                if let Ok(api_error) = serde_json::from_str::<Response>(&response_text) {
+                    return Err(GitHubUtilError::ResponseError(api_error.message));
+                }
+
+                return Err(GitHubUtilError::Json {
+                    source: json_err,
+                    body: response_text,
+                });
+            }
         }
     }
 
@@ -86,39 +106,59 @@ pub async fn list_all_releases(
 
 #[derive(Debug)]
 pub enum GitHubUtilError {
-    RequestError(String),
-    JsonParsingError(String),
+    Request(reqwest::Error),
+    Json {
+        source: serde_json::Error,
+        body: String,
+    },
     ResponseError(String),
 }
 
 impl Display for GitHubUtilError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            GitHubUtilError::RequestError(json) => write!(f, "Request Error: {}", json),
-            GitHubUtilError::JsonParsingError(json) => {
-                write!(f, "Failed to parse Json: {}", json)
+            GitHubUtilError::Request(err) => write!(f, "Request error: {}", err),
+            GitHubUtilError::Json { source, body } => {
+                write!(f, "Failed to parse JSON: {}. Response body: {}", source, body)
             }
-            GitHubUtilError::ResponseError(json) => {
-                write!(f, "Response error: {}", json)
-            }
+            GitHubUtilError::ResponseError(msg) => write!(f, "Response error: {}", msg),
         }
     }
 }
 
 impl Error for GitHubUtilError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        None
+        match self {
+            GitHubUtilError::Request(err) => Some(err),
+            GitHubUtilError::Json { source, .. } => Some(source),
+            GitHubUtilError::ResponseError(_) => None,
+        }
     }
 }
 
 impl From<reqwest::Error> for GitHubUtilError {
-    fn from(err: reqwest::Error) -> GitHubUtilError {
-        GitHubUtilError::RequestError(err.to_string())
+    fn from(err: reqwest::Error) -> Self {
+        GitHubUtilError::Request(err)
     }
 }
 
 impl From<serde_json::Error> for GitHubUtilError {
-    fn from(err: serde_json::Error) -> GitHubUtilError {
-        GitHubUtilError::JsonParsingError(err.to_string())
+    fn from(err: serde_json::Error) -> Self {
+        GitHubUtilError::Json {
+            source: err,
+            body: String::new(),
+        }
     }
+}
+
+pub fn format_error_chain(err: &(dyn Error + 'static)) -> String {
+    let mut output = format!("{}", err);
+    let mut current = err.source();
+
+    while let Some(src) = current {
+        output.push_str(&format!("\ncaused by: {}", src));
+        current = src.source();
+    }
+
+    output
 }

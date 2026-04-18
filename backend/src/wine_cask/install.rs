@@ -1,230 +1,413 @@
 use crate::github_util::{Asset, Release};
-use crate::wine_cask::app::WineCask;
-use crate::wine_cask::flavors::CompatibilityToolFlavor;
+use crate::wine_cask::app::{InstallTarget, OperationState, WineCask};
+use crate::wine_cask::flavors::{CatalogRelease, CompatibilityToolFlavor};
 use crate::wine_cask::{copy_dir, generate_compatibility_tool_vdf, recursive_delete_dir_entry};
 use crate::PeerMap;
 use flate2::bufread::GzDecoder;
 use futures_util::StreamExt;
-use log::{debug, error, info, warn};
-use serde::{Deserialize, Serialize};
-use std::env;
-use std::fs::create_dir_all;
-use std::io::{Cursor, Read};
-use std::path::{Path, PathBuf};
+use log::{error, info, warn};
+use std::fs::{create_dir_all, File};
+use std::io::{BufReader, Read};
+use std::path::{Component, Path, PathBuf};
+use tokio::fs::File as TokioFile;
+use tokio::io::AsyncWriteExt;
 use xz2::bufread::XzDecoder;
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct Install {
-    pub(crate) flavor: CompatibilityToolFlavor,
-    pub(crate) release: Release,
+#[derive(Clone)]
+struct InstallPlan {
+    catalog_release: CatalogRelease,
+    target: InstallTarget,
 }
 
-#[derive(Deserialize, Serialize, Clone)]
-pub struct QueueCompatibilityTool {
-    pub flavor: CompatibilityToolFlavor,
-    pub name: String,
-    pub url: String,
-    pub state: QueueCompatibilityToolState,
-    pub compress_type: CompressionType,
-    pub progress: u8,
-}
-
-#[derive(Deserialize, Serialize, PartialEq, Clone)]
-pub enum QueueCompatibilityToolState {
-    Extracting,
-    Downloading,
-    Waiting,
-    Cancelling,
-}
-
-#[derive(Deserialize, Serialize, PartialEq, Clone)]
-pub enum CompressionType {
+#[derive(Clone, PartialEq)]
+enum CompressionType {
     Gzip,
     Xz,
     Unknown,
 }
 
+struct DownloadPlan {
+    url: String,
+    compression_type: CompressionType,
+}
+
 impl WineCask {
-    // Why is this task queue here? Well because steam deck will die if someone tries to queue up 50 installs at once.
-    pub async fn install_compatibility_tool(&self, install: Install, peer_map: &PeerMap) {
-        if let Some(mut queue_compatibility_tool) = look_for_compressed_archive(&install) {
-            // Mark as downloading...
-            queue_compatibility_tool.state = QueueCompatibilityToolState::Downloading;
-            queue_compatibility_tool.progress = 0;
-            self.app_state.lock().await.in_progress = Some(queue_compatibility_tool.clone());
-            self.broadcast_app_state(peer_map).await;
+    pub async fn install_catalog_release(
+        &self,
+        release_id: String,
+        target: InstallTarget,
+        peer_map: &PeerMap,
+    ) {
+        let Some(catalog_release) = self.get_catalog_release(&release_id).await else {
+            self.broadcast_notification(peer_map, "Requested release is no longer available")
+                .await;
+            return;
+        };
 
-            // Starting download compatibility tool
-            let client = reqwest::Client::new();
-            let response_wrapped = client.get(&queue_compatibility_tool.url).send().await;
-            let response = response_wrapped.unwrap();
-            let total_size = response.content_length().unwrap_or(0);
+        let install_plan = InstallPlan {
+            catalog_release,
+            target: target.clone(),
+        };
 
-            let mut downloaded_bytes = Vec::new();
-            let mut downloaded_size = 0;
-            let mut body = response.bytes_stream();
+        let Some(download_plan) = look_for_compressed_archive(&install_plan.catalog_release.release) else {
+            self.broadcast_notification(
+                peer_map,
+                "Error: No supported compressed archive found for this release",
+            )
+            .await;
+            return;
+        };
 
-            while let Some(chunk_result) = body.next().await {
-                // Check if we need to cancel the download
-                if self
-                    .app_state
-                    .lock()
-                    .await
-                    .in_progress
-                    .clone()
-                    .unwrap()
-                    .state
-                    == QueueCompatibilityToolState::Cancelling
-                {
-                    self.app_state.lock().await.in_progress = None;
-                    self.broadcast_app_state(peer_map).await;
-                    return; // We stop the function here
-                }
-                if let Ok(chunk) = chunk_result {
-                    downloaded_bytes.extend_from_slice(&chunk);
-                    downloaded_size += chunk.len() as u64;
+        self.update_current_operation(OperationState::Downloading, 0, peer_map)
+            .await;
 
-                    let progress = ((downloaded_size as f64 / total_size as f64) * 100.0) as u8;
-                    if queue_compatibility_tool.progress != progress {
-                        // Update progress...
-                        queue_compatibility_tool.progress = progress;
-                        self.app_state.lock().await.in_progress =
-                            Some(queue_compatibility_tool.clone());
-                        self.broadcast_app_state(peer_map).await;
-                    }
-                } else {
-                    let error_message =
-                        "Connection Error: Download in progress failed!".to_string();
-                    error!("{}", error_message);
-                    self.app_state.lock().await.in_progress = None;
-                    self.broadcast_app_state(peer_map).await;
-                    self.broadcast_notification(peer_map, error_message.as_str())
+        let temp_dir = match prepare_temp_directory(
+            &self
+                .steam_util
+                .get_steam_compatibility_tools_directory()
+                .join(".wine-cellar-staging"),
+        ) {
+            Some(temp_dir) => temp_dir,
+            None => {
+                self.broadcast_notification(
+                    peer_map,
+                    "Failed to prepare temporary install directory",
+                )
+                .await;
+                return;
+            }
+        };
+        let archive_path = temp_dir.join(download_archive_name(&download_plan.compression_type));
+        let mut archive_file = match TokioFile::create(&archive_path).await {
+            Ok(file) => file,
+            Err(err) => {
+                cleanup_temp_directory(&temp_dir);
+                self.broadcast_notification(
+                    peer_map,
+                    &format!("Failed to create temporary archive file: {}", err),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let client = reqwest::Client::new();
+        let response = match client.get(&download_plan.url).send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                error!("Download request failed: {}", err);
+                cleanup_temp_directory(&temp_dir);
+                self.broadcast_notification(
+                    peer_map,
+                    "Connection error: Unable to start compatibility tool download",
+                )
+                .await;
+                return;
+            }
+        };
+
+        if !response.status().is_success() {
+            error!("Download failed with status {}", response.status());
+            cleanup_temp_directory(&temp_dir);
+            self.broadcast_notification(peer_map, "Connection error: Download failed")
+                .await;
+            return;
+        }
+
+        let total_size = response.content_length();
+        let mut downloaded_size = 0u64;
+        let mut body = response.bytes_stream();
+
+        while let Some(chunk_result) = body.next().await {
+            if self.current_operation_is_cancelling().await {
+                cleanup_temp_directory(&temp_dir);
+                self.broadcast_notification(peer_map, "Installation cancelled")
+                    .await;
+                return;
+            }
+
+            let chunk = match chunk_result {
+                Ok(chunk) => chunk,
+                Err(err) => {
+                    error!("Download stream failed: {}", err);
+                    cleanup_temp_directory(&temp_dir);
+                    self.broadcast_notification(peer_map, "Connection error: Download interrupted")
                         .await;
                     return;
                 }
+            };
+
+            if let Err(err) = archive_file.write_all(&chunk).await {
+                error!("Failed to write temporary archive: {}", err);
+                cleanup_temp_directory(&temp_dir);
+                self.broadcast_notification(
+                    peer_map,
+                    "Storage error: Failed to write compatibility tool archive",
+                )
+                .await;
+                return;
             }
+            downloaded_size += chunk.len() as u64;
 
-            let reader = Cursor::new(downloaded_bytes);
+            if let Some(total_size) = total_size {
+                if total_size > 0 {
+                    let progress = ((downloaded_size as f64 / total_size as f64) * 100.0)
+                        .round()
+                        .clamp(0.0, 100.0) as u8;
+                    self.update_current_operation(OperationState::Downloading, progress, peer_map)
+                        .await;
+                }
+            }
+        }
 
-            self.extract_generate_and_move(
+        if let Err(err) = archive_file.flush().await {
+            error!("Failed to flush temporary archive: {}", err);
+            cleanup_temp_directory(&temp_dir);
+            self.broadcast_notification(
                 peer_map,
-                &install,
-                &mut queue_compatibility_tool,
-                reader,
+                "Storage error: Failed to finalize compatibility tool archive",
             )
             .await;
-        } 
+            return;
+        }
+
+        drop(archive_file);
+
+        match self
+            .extract_and_install(
+                peer_map,
+                &install_plan,
+                download_plan.compression_type,
+                &temp_dir,
+                &archive_path,
+            )
+            .await
+        {
+            Ok(message) => {
+                info!("{}", message);
+                self.sync_backend_state().await;
+                self.broadcast_app_state(peer_map).await;
+                self.broadcast_notification(peer_map, &message).await;
+            }
+            Err(err) => {
+                error!("Installation failed: {}", err);
+                self.broadcast_notification(peer_map, &err).await;
+            }
+        }
+
+        cleanup_temp_directory(&temp_dir);
     }
 
-    pub async fn extract_generate_and_move(
+    async fn extract_and_install(
         &self,
         peer_map: &PeerMap,
-        install: &Install,
-        queue_compatibility_tool: &mut QueueCompatibilityTool,
-        reader: Cursor<Vec<u8>>,
-    ) {
-        if let Some(temp_dir) = prepare_temp_directory() {
-            // Mark as extracting...
-            queue_compatibility_tool.state = QueueCompatibilityToolState::Extracting;
-            queue_compatibility_tool.progress = 0;
-            self.app_state.lock().await.in_progress = Some(queue_compatibility_tool.clone());
-            self.broadcast_app_state(peer_map).await;
-
-            let steam_compatibility_tools_directory =
-                self.steam_util.get_steam_compatibility_tools_directory();
-            // Spawn a new thread for the extraction process
-            // Why do we need this turns out unpack process is blocking, because of this async function doesn't yield control back to Rust runtime until the extraction is finished.
-            let queue_compatibility_tool_clone = queue_compatibility_tool.clone(); // Clone the queue_compatibility_tool
-            let temp_dir_clone = temp_dir.clone();
-            tokio::task::spawn_blocking(move || {
-                let decompressed: Box<dyn Read> =
-                    if queue_compatibility_tool_clone.compress_type == CompressionType::Gzip {
-                        Box::new(GzDecoder::new(reader))
-                    } else if queue_compatibility_tool_clone.compress_type == CompressionType::Xz {
-                        Box::new(XzDecoder::new(reader))
-                    } else {
-                        Box::new(reader) // fixme: explosion
-                    };
-                let mut tar = tar::Archive::new(decompressed);
-                tar.unpack(temp_dir_clone).unwrap();
-            })
-            .await
-            .unwrap();
-
-            // Scan for the extracted directory
-            let valid_directories: Vec<PathBuf> = std::fs::read_dir(&temp_dir)
-                .map_err(|_err| {
-                    error!("Failed to read directory");
-                })
-                .unwrap()
-                .filter_map(Result::ok)
-                .filter(|x| {
-                    x.metadata().unwrap().is_dir()
-                        && x.path().join("compatibilitytool.vdf").exists()
-                })
-                .map(|x| x.path())
-                .collect();
-
-            if valid_directories.len() == 1 {
-                let first = valid_directories.first().unwrap();
-                let new_compat_tool_vdf = first.join("compatibilitytool.vdf");
-                let new_path = match queue_compatibility_tool.flavor {
-                    CompatibilityToolFlavor::ProtonGE => first.clone(),
-                    CompatibilityToolFlavor::SteamTinkerLaunch
-                    | CompatibilityToolFlavor::Luxtorpeda
-                    | CompatibilityToolFlavor::Boxtron => {
-                        let new_folder_name = format!(
-                            "{}{}",
-                            &queue_compatibility_tool.flavor, &install.release.tag_name
-                        );
-                        generate_compatibility_tool_vdf(
-                            new_compat_tool_vdf,
-                            &new_folder_name,
-                            &format!(
-                                "{} {}",
-                                &queue_compatibility_tool.flavor, &install.release.tag_name
-                            ),
-                        );
-                        temp_dir.join(&new_folder_name)
-                    }
-                    _ => {
-                        error!("Unsupported compatibility tool flavor");
-                        first.clone()
-                    }
-                };
-                std::fs::rename(first, &new_path).unwrap();
-
-                match copy_dir(&temp_dir, &steam_compatibility_tools_directory) {
-                    Ok(_) => debug!("Directory copied successfully."),
-                    Err(e) => error!("Failed to copy directory: {}", e),
-                }
-
-                self.sync_backend_with_installed_compat_tools().await;
-                self.broadcast_app_state(peer_map).await;
-            } else {
-                error!("Failed to find extracted directory");
-            }
-
-            cleanup_temp_directory(&temp_dir);
-
-            // Mark as completed
-            let message = format!("Installation Completed: {}", install.release.name);
-            info!("{}", message);
-            self.broadcast_notification(peer_map, message.as_str())
-                .await;
-            self.app_state.lock().await.in_progress = None;
-            self.broadcast_app_state(peer_map).await;
-        } else {
-            error!("Failed to prepare temp directory");
+        install_plan: &InstallPlan,
+        compression_type: CompressionType,
+        temp_dir: &Path,
+        archive_path: &Path,
+    ) -> Result<String, String> {
+        if self.current_operation_is_cancelling().await {
+            return Err("Installation cancelled".to_string());
         }
+
+        self.update_current_operation(OperationState::Extracting, 0, peer_map)
+            .await;
+
+        let temp_dir_clone = temp_dir.to_path_buf();
+        let archive_path_clone = archive_path.to_path_buf();
+        let unpack_result = tokio::task::spawn_blocking(move || {
+            let archive_file = File::open(&archive_path_clone)
+                .map_err(|err| format!("Failed to open temporary archive: {}", err))?;
+            let archive_reader = BufReader::new(archive_file);
+
+            let decompressed: Box<dyn Read> = if compression_type == CompressionType::Gzip {
+                Box::new(GzDecoder::new(archive_reader))
+            } else if compression_type == CompressionType::Xz {
+                Box::new(XzDecoder::new(archive_reader))
+            } else {
+                return Err("Unsupported archive compression type".to_string());
+            };
+
+            safe_unpack_tar(decompressed, &temp_dir_clone)
+        })
+        .await
+        .map_err(|err| format!("Extraction task failed: {}", err))?;
+
+        if let Err(err) = unpack_result {
+            return Err(format!("Installation failed: {}", err));
+        }
+
+        if let Err(err) = std::fs::remove_file(archive_path) {
+            warn!(
+                "Failed to delete temporary archive after extraction: {}",
+                err
+            );
+        }
+
+        if self.current_operation_is_cancelling().await {
+            return Err("Installation cancelled".to_string());
+        }
+
+        let extracted_directory = std::fs::read_dir(temp_dir)
+            .map_err(|err| format!("Failed to read extraction directory: {}", err))?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.metadata().map(|meta| meta.is_dir()).unwrap_or(false))
+            .map(|entry| entry.path())
+            .find(|path| path.join("compatibilitytool.vdf").exists())
+            .ok_or_else(|| {
+                "Failed to find the extracted compatibility tool contents".to_string()
+            })?;
+
+        if self.current_operation_is_cancelling().await {
+            return Err("Installation cancelled".to_string());
+        }
+
+        let install_result = match &install_plan.target {
+            InstallTarget::Direct => self.install_direct_tool(&extracted_directory, install_plan),
+            InstallTarget::VirtualTool { virtual_tool_id } => {
+                self.install_virtual_tool(&extracted_directory, install_plan, virtual_tool_id)
+            }
+        };
+
+        install_result
+    }
+
+    fn install_direct_tool(
+        &self,
+        extracted_directory: &Path,
+        install_plan: &InstallPlan,
+    ) -> Result<String, String> {
+        let temp_dir = extracted_directory
+            .parent()
+            .ok_or_else(|| "Missing temporary extraction parent directory".to_string())?;
+        let compatibility_tools_directory =
+            self.steam_util.get_steam_compatibility_tools_directory();
+
+        let new_path = match install_plan.catalog_release.flavor {
+            CompatibilityToolFlavor::ProtonGE => extracted_directory.to_path_buf(),
+            CompatibilityToolFlavor::SteamTinkerLaunch
+            | CompatibilityToolFlavor::Luxtorpeda
+            | CompatibilityToolFlavor::Boxtron => {
+                let new_folder_name = format!(
+                    "{}{}",
+                    install_plan.catalog_release.flavor, install_plan.catalog_release.release.tag_name
+                );
+                generate_compatibility_tool_vdf(
+                    extracted_directory.join("compatibilitytool.vdf"),
+                    &new_folder_name,
+                    &format!(
+                        "{} {}",
+                        install_plan.catalog_release.flavor, install_plan.catalog_release.release.tag_name
+                    ),
+                );
+                temp_dir.join(&new_folder_name)
+            }
+            CompatibilityToolFlavor::Unknown => {
+                return Err("Unsupported compatibility tool flavor".to_string())
+            }
+        };
+
+        if new_path != extracted_directory {
+            std::fs::rename(extracted_directory, &new_path)
+                .map_err(|err| format!("Failed to prepare compatibility tool layout: {}", err))?;
+        }
+
+        let target_directory_name = new_path
+            .file_name()
+            .ok_or_else(|| "Failed to resolve extracted compatibility tool name".to_string())?;
+        let target_directory = compatibility_tools_directory.join(target_directory_name);
+
+        copy_dir(&new_path, &target_directory).map_err(|err| {
+            format!(
+                "Failed to copy compatibility tool into Steam compatibilitytools.d: {}",
+                err
+            )
+        })?;
+
+        Ok(format!(
+            "Installation completed: {}",
+            install_plan.catalog_release.release.tag_name
+        ))
+    }
+
+    fn install_virtual_tool(
+        &self,
+        extracted_directory: &Path,
+        install_plan: &InstallPlan,
+        virtual_tool_id: &str,
+    ) -> Result<String, String> {
+        let manifest = self.load_virtual_tool_manifest();
+        let Some(virtual_tool) = manifest.tools.iter().find(|tool| tool.id == virtual_tool_id) else {
+            return Err("Virtual compatibility tool no longer exists".to_string());
+        };
+
+        let target_directory = self
+            .steam_util
+            .get_steam_compatibility_tools_directory()
+            .join(&virtual_tool.directory_name);
+
+        if target_directory.exists() {
+            recursive_delete_dir_entry(&target_directory)
+                .map_err(|err| format!("Failed to replace virtual tool contents: {}", err))?;
+        }
+
+        create_dir_all(&target_directory)
+            .map_err(|err| format!("Failed to recreate virtual tool directory: {}", err))?;
+        copy_dir(extracted_directory, &target_directory)
+            .map_err(|err| format!("Failed to copy virtual tool contents: {}", err))?;
+        generate_compatibility_tool_vdf(
+            target_directory.join("compatibilitytool.vdf"),
+            &virtual_tool.steam_internal_name,
+            &virtual_tool.user_label,
+        );
+
+        self.update_virtual_tool_payload(
+            virtual_tool_id,
+            Some(install_plan.catalog_release.id.clone()),
+        )?;
+
+        Ok(format!(
+            "Mounted {} into {}",
+            install_plan.catalog_release.release.tag_name, virtual_tool.user_label
+        ))
     }
 }
 
-fn prepare_temp_directory() -> Option<PathBuf> {
-    let temp_dir = PathBuf::from(
-        env::var("DECKY_PLUGIN_RUNTIME_DIR").unwrap_or("/tmp/decky-wine-cellar".to_string()),
-    )
-    .join("temp");
+fn safe_unpack_tar(reader: Box<dyn Read>, destination: &Path) -> Result<(), String> {
+    let mut archive = tar::Archive::new(reader);
+
+    let entries = archive
+        .entries()
+        .map_err(|err| format!("Failed to read tar entries: {}", err))?;
+
+    for entry in entries {
+        let mut entry = entry.map_err(|err| format!("Failed to process tar entry: {}", err))?;
+        let path = entry
+            .path()
+            .map_err(|err| format!("Failed to resolve tar entry path: {}", err))?;
+
+        if path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            return Err(format!(
+                "Unsafe archive entry path detected: {}",
+                path.display()
+            ));
+        }
+
+        entry
+            .unpack_in(destination)
+            .map_err(|err| format!("Failed to unpack archive entry: {}", err))?;
+    }
+
+    Ok(())
+}
+
+fn prepare_temp_directory(staging_root: &Path) -> Option<PathBuf> {
+    let temp_dir = staging_root.join("temp");
 
     if temp_dir.exists() {
         warn!("Found existing temp directory, cleaning up...");
@@ -239,32 +422,29 @@ fn prepare_temp_directory() -> Option<PathBuf> {
     Some(temp_dir)
 }
 
+fn download_archive_name(compression_type: &CompressionType) -> &'static str {
+    match compression_type {
+        CompressionType::Gzip => "download.tar.gz",
+        CompressionType::Xz => "download.tar.xz",
+        CompressionType::Unknown => "download.tar",
+    }
+}
+
 fn cleanup_temp_directory(temp_dir: &Path) {
     if let Err(err) = recursive_delete_dir_entry(temp_dir) {
         error!("Failed to clean up temp directory: {}", err);
     }
 }
 
-pub fn look_for_compressed_archive(install_request: &Install) -> Option<QueueCompatibilityTool> {
-    /*if install_request.flavor == CompatibilityToolFlavor::SteamTinkerLaunch {// fixme: doesn't actually work we need to handle this STL separately
-        return Some(QueueCompatibilityTool {
-            flavor: install_request.flavor.to_owned(),
-            name: install_request.release.tag_name.to_owned(),
-            url: format!("https://codeload.github.com/sonic2kk/steamtinkerlaunch/legacy.tar.gz/refs/tags/{}", install_request.release.tag_name), //install_request.release.tarball_url.to_owned(),
-            state: QueueCompatibilityToolState::Waiting,
-            compress_type: CompressionType::Gzip,
-            progress: 0,
-        });
-    }*/
-
-    let is_compressed = |asset: &Asset| {
+fn look_for_compressed_archive(release: &Release) -> Option<DownloadPlan> {
+    let is_supported_archive = |asset: &Asset| {
         asset.content_type == "application/gzip"
             || asset.content_type == "application/x-xz"
             || asset.name.ends_with(".tar.gz")
             || asset.name.ends_with(".tar.xz")
     };
 
-    let compress_type = |asset: &Asset| {
+    let compression_type = |asset: &Asset| {
         if asset.content_type == "application/gzip" || asset.name.ends_with(".tar.gz") {
             CompressionType::Gzip
         } else if asset.content_type == "application/x-xz" || asset.name.ends_with(".tar.xz") {
@@ -274,22 +454,12 @@ pub fn look_for_compressed_archive(install_request: &Install) -> Option<QueueCom
         }
     };
 
-    if let Some(asset) = install_request
-        .release
+    release
         .assets
-        .clone()
-        .into_iter()
-        .find(is_compressed)
-    {
-        return Some(QueueCompatibilityTool {
-            flavor: install_request.flavor.to_owned(),
-            name: install_request.release.tag_name.to_owned(),
-            url: asset.clone().browser_download_url,
-            state: QueueCompatibilityToolState::Waiting,
-            compress_type: compress_type(&asset),
-            progress: 0,
-        });
-    }
-
-    None
+        .iter()
+        .find(|asset| is_supported_archive(asset))
+        .map(|asset| DownloadPlan {
+            url: asset.browser_download_url.clone(),
+            compression_type: compression_type(asset),
+        })
 }

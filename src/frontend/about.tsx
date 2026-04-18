@@ -7,18 +7,12 @@ import {
   Focusable,
   Navigation,
 } from "@decky/ui";
-import { SiDiscord, SiGithub, SiKofi } from "react-icons/si";
-import { HiOutlineQrCode } from "react-icons/hi2";
-import { showQrModal } from "../components/showQrModal";
 import { formatDistanceToNow, fromUnixTime } from "date-fns";
-import {
-  AppState,
-  Request,
-  RequestType,
-  TaskType,
-  UpdaterState,
-} from "../types";
-import { error } from "../utils/logger";
+import { HiOutlineQrCode } from "react-icons/hi2";
+import { SiDiscord, SiGithub, SiKofi } from "react-icons/si";
+import { AppState, UpdaterState } from "../types";
+import { showQrModal } from "../components/showQrModal";
+import { refreshCatalog } from "../utils/backendApi";
 
 export default function About({
   appState,
@@ -32,9 +26,9 @@ export default function About({
       <DialogControlsSection>
         <div>
           <p>
-            Wine Cellar is a compatibility tool manager for Steam. It allows you
-            to install, uninstall, and update compatibility tools for Steam
-            games.
+            Wine Cellar is a compatibility tool manager for Steam. It can
+            install tools directly, maintain reusable virtual compatibility
+            slots, and show which tools the current Steam session has loaded.
           </p>
         </div>
         <DialogControlsSectionHeader>Wine Cellar</DialogControlsSectionHeader>
@@ -63,9 +57,8 @@ function SystemInformation({
           description={
             "Last checked: " +
             (appState.updater_last_check != null
-              ? formatDistanceToNow(
-                  fromUnixTime(appState.updater_last_check!),
-                ) + " ago"
+              ? formatDistanceToNow(fromUnixTime(appState.updater_last_check)) +
+                " ago"
               : "Never")
           }
           bottomSeparator={"none"}
@@ -73,17 +66,7 @@ function SystemInformation({
           <DialogButton
             disabled={appState.updater_state == UpdaterState.Checking}
             onClick={() => {
-              if (socket && socket.readyState === WebSocket.OPEN) {
-                const response: Request = {
-                  type: RequestType.Task,
-                  task: {
-                    type: TaskType.CheckForFlavorUpdates,
-                  },
-                };
-                socket.send(JSON.stringify(response));
-              } else {
-                error("WebSocket not alive...");
-              }
+              refreshCatalog(socket);
             }}
           >
             {appState.updater_state == UpdaterState.Idle
@@ -121,7 +104,6 @@ function ProjectInformation() {
   return (
     <Focusable style={{ display: "flex", flexDirection: "column" }}>
       {socialLinks.map((linkInfo, index) => (
-        //padding compact is broken lol
         <Field
           key={index}
           label={linkInfo.label}

@@ -29,32 +29,67 @@ impl std::fmt::Display for CompatibilityToolFlavor {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct Flavor {
+pub struct CatalogRelease {
+    pub id: String,
     pub flavor: CompatibilityToolFlavor,
-    pub releases: Vec<Release>,
+    pub release: Release,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct SteamCompatibilityTool {
+pub struct Flavor {
+    pub flavor: CompatibilityToolFlavor,
+    pub releases: Vec<CatalogRelease>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub enum InstalledToolSource {
+    Direct,
+    Virtual,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct InstalledCompatibilityTool {
+    pub id: String,
     pub path: String,
-    //pub directory_name: String,
+    pub directory_name: String,
     pub display_name: String,
     pub internal_name: String,
     pub used_by_games: Vec<String>,
     pub requires_restart: bool,
     pub flavor: CompatibilityToolFlavor,
+    pub catalog_release_id: Option<String>,
     pub github_release: Option<Release>,
-    //pub r#virtual: bool,
-    //pub virtual_original: String, // Display name or Internal name or name?
+    pub source: InstalledToolSource,
+    pub virtual_tool_id: Option<String>,
+    pub user_label: Option<String>,
 }
 
-// SteamClient.Apps.GetAvailableCompatTools()
+#[derive(Serialize, Deserialize, Clone)]
+pub struct VirtualCompatibilityTool {
+    pub id: String,
+    pub user_label: String,
+    pub steam_internal_name: String,
+    pub directory_name: String,
+    pub installed_tool_id: Option<String>,
+    pub current_payload_release_id: Option<String>,
+    pub current_payload_name: Option<String>,
+    pub current_payload_flavor: CompatibilityToolFlavor,
+    pub github_release: Option<Release>,
+    pub requires_restart: bool,
+    pub used_by_games: Vec<String>,
+}
+
+// SteamClient.Settings.GetGlobalCompatTools()
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SteamClientCompatToolInfo {
     #[serde(rename = "strToolName")]
     pub str_tool_name: String,
     #[serde(rename = "strDisplayName")]
     pub str_display_name: String,
+}
+
+pub fn catalog_release_id(flavor: &CompatibilityToolFlavor, release_id: u64) -> String {
+    format!("catalog:{}:{}", flavor, release_id)
 }
 
 impl WineCask {
@@ -69,15 +104,6 @@ impl WineCask {
                 renew_cache,
             )
             .await;
-        /*let steam_tinker_launch_flavor = self
-        .get_flavor(
-            &installed_compatibility_tools,
-            CompatibilityToolFlavor::SteamTinkerLaunch,
-            "sonic2kk",
-            "steamtinkerlaunch",
-            renew_cache,
-        )
-        .await;*/
         let luxtorpeda_flavor = self
             .get_flavor(
                 CompatibilityToolFlavor::Luxtorpeda,
@@ -96,7 +122,6 @@ impl WineCask {
             .await;
 
         flavors.push(proton_ge_flavor);
-        //flavors.push(steam_tinker_launch_flavor); fixme: we need to have a special installation process for this.
         flavors.push(luxtorpeda_flavor);
         flavors.push(boxtron_flavor);
 
@@ -112,8 +137,15 @@ impl WineCask {
     ) -> Flavor {
         if let Some(github_releases) = self.get_releases(owner, repository, renew_cache).await {
             Flavor {
-                flavor: compatibility_tool_flavor,
-                releases: github_releases,
+                flavor: compatibility_tool_flavor.clone(),
+                releases: github_releases
+                    .into_iter()
+                    .map(|release| CatalogRelease {
+                        id: catalog_release_id(&compatibility_tool_flavor, release.id),
+                        flavor: compatibility_tool_flavor.clone(),
+                        release,
+                    })
+                    .collect(),
             }
         } else {
             Flavor {
@@ -123,63 +155,13 @@ impl WineCask {
         }
     }
 
-    pub async fn update_compatibility_tools_and_available_flavors(&self) {
-        let mut app_state = self.app_state.lock().await;
-        app_state.available_flavors.clear();
-        for flavor in app_state.flavors.clone() {
-            let mut installed_compatibility_tools = app_state.installed_compatibility_tools.clone();
-            let compatibility_tool_flavor = flavor.flavor.clone();
-            let github_releases = flavor.releases.clone();
-
-            for steam_compat_tool in &mut installed_compatibility_tools {
-                if let Some(release) = github_releases.iter().find(|gh| {
-                    if compatibility_tool_flavor == CompatibilityToolFlavor::ProtonGE {
-                        steam_compat_tool.internal_name == gh.tag_name
-                            || steam_compat_tool.display_name == gh.tag_name
-                    } else {
-                        steam_compat_tool.display_name
-                            == compatibility_tool_flavor.to_string() + " " + &gh.tag_name
-                            || steam_compat_tool.internal_name
-                                == compatibility_tool_flavor.to_string() + &gh.tag_name
-                    }
-                }) {
-                    steam_compat_tool.flavor = compatibility_tool_flavor.clone();
-                    steam_compat_tool.github_release = Some(release.clone());
-                }
-            }
-
-            app_state.installed_compatibility_tools = installed_compatibility_tools.clone();
-
-            let not_installed: Vec<Release> = github_releases
-                .iter()
-                .filter(|gh| {
-                    !installed_compatibility_tools.iter().any(|tool| {
-                        if compatibility_tool_flavor == CompatibilityToolFlavor::ProtonGE {
-                            tool.internal_name == gh.tag_name || tool.display_name == gh.tag_name
-                        } else {
-                            tool.display_name
-                                == compatibility_tool_flavor.to_string() + " " + &gh.tag_name
-                                || tool.internal_name
-                                    == compatibility_tool_flavor.to_string() + &gh.tag_name
-                        }
-                    })
-                })
-                .cloned()
-                .collect();
-            app_state.available_flavors.push(Flavor {
-                flavor: compatibility_tool_flavor,
-                releases: not_installed,
-            });
-        }
-    }
-
     async fn get_releases(
         &self,
         owner: &str,
         repository: &str,
         renew_cache: bool,
     ) -> Option<Vec<Release>> {
-        const SECONDS_IN_A_DAY: u64 = 84_600;
+        const SECONDS_IN_A_DAY: u64 = 86_400;
 
         let path = env::var("DECKY_PLUGIN_RUNTIME_DIR").unwrap_or("/tmp/".parse().unwrap());
 
@@ -190,12 +172,10 @@ impl WineCask {
             let metadata = fs::metadata(&cache_file).ok()?;
             let modified = metadata.modified().ok()?;
 
-            // Calculate the duration between the current time and the file modification time
             let now = SystemTime::now();
             let duration = now.duration_since(modified).ok()?;
 
             if duration.as_secs() < SECONDS_IN_A_DAY {
-                // Update last checked time with file last modified time
                 let unix_timestamp = modified
                     .duration_since(UNIX_EPOCH)
                     .expect("Failed to calculate duration")
@@ -205,9 +185,10 @@ impl WineCask {
                 let string = fs::read_to_string(&cache_file).ok()?;
                 let github_releases: Vec<Release> = serde_json::from_str(&string).ok()?;
 
-                // Check if parsing failed but data exists (cache is corrupted)
                 if github_releases.is_empty() {
-                    info!("Cached data is possibly corrupted or possibly missing information from outdated version. Renewing cache...");
+                    info!(
+                        "Cached data is possibly corrupted or missing information from an older version. Renewing cache..."
+                    );
                 } else {
                     return Some(github_releases);
                 }
@@ -223,7 +204,6 @@ impl WineCask {
                     return None;
                 }
 
-                // Update last checked time
                 let current_time = SystemTime::now();
                 let unix_timestamp = current_time
                     .duration_since(UNIX_EPOCH)
@@ -235,9 +215,11 @@ impl WineCask {
                 fs::write(&cache_file, json).ok()?;
                 releases
             }
-            Err(_) => {
+            Err(err) => {
+                error!("{}", github_util::format_error_chain(&err));
+                error!("full debug error: {err:#?}");
+
                 if cache_file.exists() && cache_file.is_file() {
-                    // Update last checked time with file last modified time
                     let metadata = fs::metadata(&cache_file).ok()?;
                     let modified = metadata.modified().ok()?;
                     let unix_timestamp = modified
