@@ -11,6 +11,7 @@ use std::{env, fs};
 pub enum CompatibilityToolFlavor {
     Unknown,
     ProtonGE,
+    ProtonCachyOS,
     SteamTinkerLaunch,
     Luxtorpeda,
     Boxtron,
@@ -21,6 +22,7 @@ impl std::fmt::Display for CompatibilityToolFlavor {
         match self {
             CompatibilityToolFlavor::Unknown => write!(f, "Unknown"),
             CompatibilityToolFlavor::ProtonGE => write!(f, "ProtonGE"),
+            CompatibilityToolFlavor::ProtonCachyOS => write!(f, "ProtonCachyOS"),
             CompatibilityToolFlavor::SteamTinkerLaunch => write!(f, "SteamTinkerLaunch"),
             CompatibilityToolFlavor::Luxtorpeda => write!(f, "Luxtorpeda"),
             CompatibilityToolFlavor::Boxtron => write!(f, "Boxtron"),
@@ -125,7 +127,65 @@ impl WineCask {
         flavors.push(luxtorpeda_flavor);
         flavors.push(boxtron_flavor);
 
+        let proton_cachyos_flavor = self
+            .get_flavor_with_v3_filter(
+                CompatibilityToolFlavor::ProtonCachyOS,
+                "CachyOS",
+                "proton-cachyos",
+                renew_cache,
+            )
+            .await;
+        flavors.push(proton_cachyos_flavor);
+
         flavors
+    }
+
+    async fn get_flavor_with_v3_filter(
+        &self,
+        compatibility_tool_flavor: CompatibilityToolFlavor,
+        owner: &str,
+        repository: &str,
+        renew_cache: bool,
+    ) -> Flavor {
+        let releases = self.get_releases(owner, repository, renew_cache).await;
+
+        if let Some(releases) = releases {
+            let filtered = Self::filter_v3_releases(releases);
+            if filtered.is_empty() {
+                return Flavor {
+                    flavor: compatibility_tool_flavor,
+                    releases: Vec::new(),
+                };
+            }
+            Flavor {
+                flavor: compatibility_tool_flavor.clone(),
+                releases: filtered
+                    .into_iter()
+                    .map(|release| CatalogRelease {
+                        id: catalog_release_id(&compatibility_tool_flavor, release.id),
+                        flavor: compatibility_tool_flavor.clone(),
+                        release,
+                    })
+                    .collect(),
+            }
+        } else {
+            Flavor {
+                flavor: compatibility_tool_flavor,
+                releases: Vec::new(),
+            }
+        }
+    }
+
+    fn filter_v3_releases(releases: Vec<Release>) -> Vec<Release> {
+        let allowed_arches = ["x86_64_v3"];
+        releases
+            .into_iter()
+            .filter(|release| {
+                release.assets.iter().any(|asset| {
+                    allowed_arches.iter().any(|arch| asset.name.contains(arch))
+                })
+            })
+            .collect()
     }
 
     async fn get_flavor(
