@@ -826,6 +826,10 @@ fn find_catalog_release_for_tool(
                 {
                     return Some(catalog_release.clone());
                 }
+            } else if flavor.flavor == CompatibilityToolFlavor::ProtonCachyOS {
+                if installed_tool.display_name.to_lowercase().contains("cachyos") {
+                    return Some(catalog_release.clone());
+                }
             } else if installed_tool.display_name
                 == format!("{} {}", flavor.flavor, catalog_release.release.tag_name)
                 || installed_tool.internal_name
