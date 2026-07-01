@@ -22,7 +22,7 @@ jobs:
         with:
           version: 9
           cache: false
-          run_install: true
+          run_install: false
       - name: Decky CLI Build
         run: |
           mkdir $(pwd)/cli
