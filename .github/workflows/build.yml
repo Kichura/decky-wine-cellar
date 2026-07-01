@@ -24,40 +24,31 @@ jobs:
           cache: false
           run_install: true
       - name: Build frontend
-        run: pnpm build
-      - name: Extract project name
-        id: extract-project-name
-        run: echo "project_name=$(jq -r '.name' plugin.json)" >> $GITHUB_OUTPUT
-      - name: Extract project version
-        id: extract-project-version
-        run: echo "project_version=$(jq -r '.version' package.json)" >> $GITHUB_OUTPUT
-      - name: Create directory
-        run: mkdir -p "${{ steps.extract-project-name.outputs.project_name }}/bin"
-      - name: Copy frontend files
-        run: cp -r dist "${{ steps.extract-project-name.outputs.project_name }}"
-      - name: Set up Rust
-        run: rustup update
-      - name: Extract backend binary name
-        id: extract-backend-binary-name
-        run: echo "binary_name=$(awk -F ' = ' '$1 == "name" {print $2}' backend/Cargo.toml | tr -d '\"')" >> $GITHUB_OUTPUT
+        id: metadata
+        run: |
+          pnpm build
+          project_name=$(jq -r '.name' plugin.json)
+          project_version=$(jq -r '.version' package.json)
+          echo "project_name=$project_name" >> $GITHUB_OUTPUT
+          echo "project_version=$project_version" >> $GITHUB_OUTPUT
+          mkdir -p "$project_name/bin"
+          cp -r dist "$project_name"
       - name: Build backend
-        run: cargo build --release --manifest-path backend/Cargo.toml
-      - name: Copy backend binary
         run: |
-          chmod +x backend/target/release/${{ steps.extract-backend-binary-name.outputs.binary_name }}
-          cp backend/target/release/${{ steps.extract-backend-binary-name.outputs.binary_name }} "${{ steps.extract-project-name.outputs.project_name }}/bin/backend"
-      - name: Copy additional files
-        run: |
-          cp main.py "${{ steps.extract-project-name.outputs.project_name }}"
-          cp LICENSE "${{ steps.extract-project-name.outputs.project_name }}"
-          cp README.md "${{ steps.extract-project-name.outputs.project_name }}"
-          cp package.json "${{ steps.extract-project-name.outputs.project_name }}"
-          cp plugin.json "${{ steps.extract-project-name.outputs.project_name }}"
-          mkdir build
-          cp -r "${{ steps.extract-project-name.outputs.project_name }}" build
+          binary_name=$(awk -F ' = ' '$1 == "name" {print $2}' backend/Cargo.toml | tr -d '\"')
+          cargo build --release --manifest-path backend/Cargo.toml
+          chmod +x backend/target/release/$binary_name
+          cp backend/target/release/$binary_name "${{ steps.metadata.outputs.project_name }}/bin/backend"
+          cp main.py "${{ steps.metadata.outputs.project_name }}"
+          cp LICENSE "${{ steps.metadata.outputs.project_name }}"
+          cp README.md "${{ steps.metadata.outputs.project_name }}"
+          cp package.json "${{ steps.metadata.outputs.project_name }}"
+          cp plugin.json "${{ steps.metadata.outputs.project_name }}"
+          mkdir -p build
+          cp -r "${{ steps.metadata.outputs.project_name }}" build
       - name: Upload Artifacts to GitHub
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: "${{ steps.extract-project-name.outputs.project_name }}-${{ steps.extract-project-version.outputs.project_version }}"
+          name: "${{ steps.metadata.outputs.project_name }}-${{ steps.metadata.outputs.project_version }}"
           path: "build"
           if-no-files-found: error
